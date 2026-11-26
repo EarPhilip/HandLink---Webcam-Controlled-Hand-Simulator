@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
@@ -15,6 +16,8 @@ import javax.swing.SwingWorker;
 import nu.pattern.OpenCV;
 import org.opencv.core.Core;
 import org.opencv.core.Mat;
+import org.opencv.core.Rect;
+import org.opencv.core.Scalar;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
@@ -25,6 +28,13 @@ public class WebcamPanel extends JPanel {
 
     private final JButton cameraButton =
         new JButton("Start Camera");
+
+    private final JButton calibrateButton = new JButton("Calibrate Background");
+    private final JCheckBox maskBox = new JCheckBox("Show Mask");
+    private final JLabel status = new JLabel("Start the camera to begin", SwingConstants.CENTER);
+    private final AtomicBoolean calibrationRequested = new AtomicBoolean(false);
+    private final AtomicBoolean calibrated = new AtomicBoolean(false);
+    private final AtomicBoolean showMask = new AtomicBoolean(false);
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private SwingWorker<Void, BufferedImage> worker;
@@ -37,7 +47,24 @@ public class WebcamPanel extends JPanel {
         preview.setPreferredSize(new Dimension(640, 480));
 
         add(preview, BorderLayout.CENTER);
-        add(cameraButton, BorderLayout.SOUTH);
+        status.setForeground(Color.WHITE);
+        add(status, BorderLayout.NORTH);
+
+        JPanel cameraControls = new JPanel();
+        cameraControls.setBackground(getBackground());
+        maskBox.setBackground(getBackground());
+        maskBox.setForeground(Color.WHITE);
+        calibrateButton.setEnabled(false);
+        cameraControls.add(cameraButton);
+        cameraControls.add(calibrateButton);
+        cameraControls.add(maskBox);
+        add(cameraControls, BorderLayout.SOUTH);
+
+        calibrateButton.addActionListener(event -> {
+            calibrationRequested.set(true);
+            status.setText("Saving the empty background...");
+        });
+        maskBox.addActionListener(event -> showMask.set(maskBox.isSelected()));
 
         cameraButton.addActionListener(event -> {
             if (worker == null) {
@@ -51,6 +78,9 @@ public class WebcamPanel extends JPanel {
     public void startCamera() {
         if (worker != null) return;
 
+        calibrationRequested.set(false);
+        calibrated.set(false);
+        status.setText("Empty the green box, then calibrate");
         running.set(true);
         preview.setText("Opening camera...");
         cameraButton.setText("Stop Camera");
@@ -63,7 +93,7 @@ public class WebcamPanel extends JPanel {
                 VideoCapture camera = new VideoCapture();
                 Mat frame = new Mat();
 
-                try {
+                try (BackgroundDetector detector = new BackgroundDetector()) {
                     if (!running.get()) return null;
 
                     if (!camera.open(0)) {
@@ -82,7 +112,28 @@ public class WebcamPanel extends JPanel {
                         Core.flip(frame, frame, 1);
                         Imgproc.resize(frame, frame, new Size(640, 480));
 
-                        publish(toImage(frame));
+                        // Analyze only the box, keeping your face/body outside it.
+                        Rect box = new Rect(160, 40, 320, 400);
+                        Mat region = frame.submat(box);
+                        try {
+                            if (calibrationRequested.getAndSet(false)) {
+                                detector.calibrate(region);
+                                calibrated.set(true);
+                            }
+
+                            Mat mask = detector.createMask(region);
+                            if (showMask.get()) {
+                                publish(toImage(mask));
+                            } else {
+                                Imgproc.rectangle(
+                                    frame, box.tl(), box.br(),
+                                    new Scalar(190, 224, 130), 2
+                                );
+                                publish(toImage(frame));
+                            }
+                        } finally {
+                            region.release();
+                        }
                         Thread.sleep(33);
                     }
                 } finally {
@@ -98,6 +149,11 @@ public class WebcamPanel extends JPanel {
                 if (worker != this || !running.get() || !isDisplayable()) {
                     return;
                 }
+
+                calibrateButton.setEnabled(true);
+                status.setText(calibrated.get()
+                    ? "Background saved - place your hand in the box"
+                    : "Empty the green box, then click Calibrate Background");
 
                 BufferedImage latest = frames.get(frames.size() - 1);
 
@@ -142,6 +198,9 @@ public class WebcamPanel extends JPanel {
                     worker = null;
                     cameraButton.setText("Start Camera");
                     cameraButton.setEnabled(true);
+                    calibrateButton.setEnabled(false);
+                    calibrated.set(false);
+                    status.setText("Start the camera to begin");
                 }
             }
         };
@@ -155,13 +214,16 @@ public class WebcamPanel extends JPanel {
         running.set(false);
         cameraButton.setText("Stopping camera...");
         cameraButton.setEnabled(false);
+        calibrateButton.setEnabled(false);
     }
 
     private static BufferedImage toImage(Mat frame) {
         BufferedImage image = new BufferedImage(
             frame.cols(),
             frame.rows(),
-            BufferedImage.TYPE_3BYTE_BGR
+            frame.channels() == 1
+                ? BufferedImage.TYPE_BYTE_GRAY
+                : BufferedImage.TYPE_3BYTE_BGR
         );
 
         byte[] pixels =
