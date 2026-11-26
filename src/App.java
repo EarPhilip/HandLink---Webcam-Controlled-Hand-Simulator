@@ -1,6 +1,8 @@
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.GridLayout;
 import javax.swing.BorderFactory;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -10,14 +12,16 @@ import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 
 public class App {
+
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            JFrame window = new JFrame("HandLink - Hand Simulator");
+            Color background = new Color(18, 24, 34);
 
-            window.setSize(900, 650);
+            JFrame window = new JFrame("HandLink - Hand Simulator");
+            window.setSize(900, 800);
             window.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             window.setLocationRelativeTo(null);
-            window.getContentPane().setBackground(new Color(18, 24, 34));
+            window.getContentPane().setBackground(background);
 
             JLabel title = new JLabel(
                 "HandLink",
@@ -29,20 +33,39 @@ public class App {
 
             HandPanel handPanel = new HandPanel();
 
-            JSlider indexSlider = new JSlider(0, 100, 0);
-            indexSlider.setMajorTickSpacing(25);
-            indexSlider.setPaintTicks(true);
-            indexSlider.setPaintLabels(true);
-
-            indexSlider.addChangeListener(event -> {
-                handPanel.setIndexCurl(indexSlider.getValue());
-            });
-
-            JPanel controls = new JPanel(new BorderLayout());
+            JPanel controls = new JPanel(new GridLayout(5, 1, 0, 5));
+            controls.setBackground(background);
             controls.setBorder(
-                BorderFactory.createTitledBorder("Index finger curl")
+                BorderFactory.createEmptyBorder(10, 25, 20, 25)
             );
-            controls.add(indexSlider, BorderLayout.CENTER);
+
+            String[] names = {
+                "Thumb", "Index", "Middle", "Ring", "Pinky"
+            };
+
+            for (int i = 0; i < names.length; i++) {
+                // Each listener keeps its own finger index.
+                final int finger = i;
+
+                JLabel label = new JLabel(names[i]);
+                label.setForeground(Color.WHITE);
+                label.setPreferredSize(new Dimension(70, 30));
+
+                JSlider slider = new JSlider(0, 100, 0);
+                slider.setBackground(background);
+                slider.setToolTipText("0 = straight, 100 = curled");
+
+                slider.addChangeListener(event -> {
+                    handPanel.setFingerCurl(finger, slider.getValue());
+                });
+
+                JPanel row = new JPanel(new BorderLayout(10, 0));
+                row.setBackground(background);
+                row.add(label, BorderLayout.WEST);
+                row.add(slider, BorderLayout.CENTER);
+
+                controls.add(row);
+            }
 
             window.add(title, BorderLayout.NORTH);
             window.add(handPanel, BorderLayout.CENTER);
