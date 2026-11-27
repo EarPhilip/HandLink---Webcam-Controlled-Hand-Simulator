@@ -2,9 +2,13 @@ import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Image;
+import java.awt.GridLayout;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
@@ -23,6 +27,12 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 
 public class WebcamPanel extends JPanel {
+    private record CameraFrame(
+        BufferedImage image, GestureDetector.Gesture gesture, int calibrationEpoch
+    ) { }
+    private GestureDetector.Gesture latestGesture = GestureDetector.Gesture.NO_HAND;
+    private Consumer<GestureDetector.Gesture> gestureListener = gesture -> { };
+    private final JLabel gestureLabel = new JLabel("Gesture: camera off", SwingConstants.CENTER);
     private final JLabel preview =
         new JLabel("Camera off", SwingConstants.CENTER);
 
@@ -32,12 +42,12 @@ public class WebcamPanel extends JPanel {
     private final JButton calibrateButton = new JButton("Calibrate Background");
     private final JCheckBox maskBox = new JCheckBox("Show Mask");
     private final JLabel status = new JLabel("Start the camera to begin", SwingConstants.CENTER);
-    private final AtomicBoolean calibrationRequested = new AtomicBoolean(false);
-    private final AtomicBoolean calibrated = new AtomicBoolean(false);
+    // A new epoch invalidates any frames queued before recalibration.
+    private final AtomicInteger calibrationEpoch = new AtomicInteger();
     private final AtomicBoolean showMask = new AtomicBoolean(false);
 
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private SwingWorker<Void, BufferedImage> worker;
+    private SwingWorker<Void, CameraFrame> worker;
 
     public WebcamPanel() {
         setLayout(new BorderLayout(0, 10));
@@ -48,7 +58,12 @@ public class WebcamPanel extends JPanel {
 
         add(preview, BorderLayout.CENTER);
         status.setForeground(Color.WHITE);
-        add(status, BorderLayout.NORTH);
+        gestureLabel.setForeground(new Color(130, 224, 190));
+        JPanel information = new JPanel(new GridLayout(2, 1, 0, 4));
+        information.setBackground(getBackground());
+        information.add(status);
+        information.add(gestureLabel);
+        add(information, BorderLayout.NORTH);
 
         JPanel cameraControls = new JPanel();
         cameraControls.setBackground(getBackground());
@@ -61,7 +76,9 @@ public class WebcamPanel extends JPanel {
         add(cameraControls, BorderLayout.SOUTH);
 
         calibrateButton.addActionListener(event -> {
-            calibrationRequested.set(true);
+            calibrationEpoch.incrementAndGet();
+            reportGesture(GestureDetector.Gesture.NO_HAND);
+            gestureLabel.setText("Gesture: recalibrating background");
             status.setText("Saving the empty background...");
         });
         maskBox.addActionListener(event -> showMask.set(maskBox.isSelected()));
@@ -78,14 +95,15 @@ public class WebcamPanel extends JPanel {
     public void startCamera() {
         if (worker != null) return;
 
-        calibrationRequested.set(false);
-        calibrated.set(false);
+        calibrationEpoch.set(0);
+        reportGesture(GestureDetector.Gesture.NO_HAND);
+        gestureLabel.setText("Gesture: calibrate background first");
         status.setText("Empty the green box, then calibrate");
         running.set(true);
         preview.setText("Opening camera...");
         cameraButton.setText("Stop Camera");
 
-        worker = new SwingWorker<Void, BufferedImage>() {
+        worker = new SwingWorker<Void, CameraFrame>() {
             @Override
             protected Void doInBackground() throws Exception {
                 OpenCV.loadLocally();
@@ -93,7 +111,8 @@ public class WebcamPanel extends JPanel {
                 VideoCapture camera = new VideoCapture();
                 Mat frame = new Mat();
 
-                try (BackgroundDetector detector = new BackgroundDetector()) {
+                try (BackgroundDetector detector = new BackgroundDetector();
+                     GestureDetector gestures = new GestureDetector()) {
                     if (!running.get()) return null;
 
                     if (!camera.open(0)) {
@@ -102,6 +121,7 @@ public class WebcamPanel extends JPanel {
                         );
                     }
 
+                    int appliedEpoch = 0;
                     while (running.get()) {
                         if (!camera.read(frame) || frame.empty()) {
                             throw new IllegalStateException(
@@ -116,20 +136,25 @@ public class WebcamPanel extends JPanel {
                         Rect box = new Rect(160, 40, 320, 400);
                         Mat region = frame.submat(box);
                         try {
-                            if (calibrationRequested.getAndSet(false)) {
+                            int requestedEpoch = calibrationEpoch.get();
+                            if (requestedEpoch != appliedEpoch) {
                                 detector.calibrate(region);
-                                calibrated.set(true);
+                                gestures.reset();
+                                appliedEpoch = requestedEpoch;
                             }
 
                             Mat mask = detector.createMask(region);
+                            GestureDetector.Gesture gesture = appliedEpoch > 0
+                                ? gestures.update(mask)
+                                : GestureDetector.Gesture.NO_HAND;
                             if (showMask.get()) {
-                                publish(toImage(mask));
+                                publish(new CameraFrame(toImage(mask), gesture, appliedEpoch));
                             } else {
                                 Imgproc.rectangle(
                                     frame, box.tl(), box.br(),
                                     new Scalar(190, 224, 130), 2
                                 );
-                                publish(toImage(frame));
+                                publish(new CameraFrame(toImage(frame), gesture, appliedEpoch));
                             }
                         } finally {
                             region.release();
@@ -145,17 +170,24 @@ public class WebcamPanel extends JPanel {
             }
 
             @Override
-            protected void process(List<BufferedImage> frames) {
+            protected void process(List<CameraFrame> frames) {
                 if (worker != this || !running.get() || !isDisplayable()) {
                     return;
                 }
 
+                CameraFrame result = frames.get(frames.size() - 1);
+                if (result.calibrationEpoch() != calibrationEpoch.get()) return;
+                boolean calibrated = result.calibrationEpoch() > 0;
                 calibrateButton.setEnabled(true);
-                status.setText(calibrated.get()
+                status.setText(calibrated
                     ? "Background saved - place your hand in the box"
                     : "Empty the green box, then click Calibrate Background");
 
-                BufferedImage latest = frames.get(frames.size() - 1);
+                reportGesture(result.gesture());
+                gestureLabel.setText(calibrated
+                    ? "Gesture: " + result.gesture().label()
+                    : "Gesture: calibrate background first");
+                BufferedImage latest = result.image();
 
                 // Fit the image inside the panel without stretching it.
                 double scale = Math.min(
@@ -199,8 +231,9 @@ public class WebcamPanel extends JPanel {
                     cameraButton.setText("Start Camera");
                     cameraButton.setEnabled(true);
                     calibrateButton.setEnabled(false);
-                    calibrated.set(false);
+                    reportGesture(GestureDetector.Gesture.NO_HAND);
                     status.setText("Start the camera to begin");
+                    gestureLabel.setText("Gesture: camera off");
                 }
             }
         };
@@ -212,9 +245,22 @@ public class WebcamPanel extends JPanel {
         if (worker == null) return;
 
         running.set(false);
+        reportGesture(GestureDetector.Gesture.NO_HAND);
         cameraButton.setText("Stopping camera...");
         cameraButton.setEnabled(false);
         calibrateButton.setEnabled(false);
+    }
+
+    // Register and invoke listeners on Swing's event dispatch thread.
+    public void setGestureListener(Consumer<GestureDetector.Gesture> listener) {
+        gestureListener = Objects.requireNonNull(listener);
+        gestureListener.accept(latestGesture);
+    }
+
+    private void reportGesture(GestureDetector.Gesture gesture) {
+        if (gesture == latestGesture) return;
+        latestGesture = gesture;
+        gestureListener.accept(gesture);
     }
 
     private static BufferedImage toImage(Mat frame) {
